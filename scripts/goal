@@ -1,0 +1,173 @@
+#!/usr/bin/env node
+/**
+ * goal — управление целью сессии с сохранением состояния.
+ *
+ * Состояние лежит в ~/.claude/goal.json и переживает перезапуск.
+ * Хуки Claude Code читают его и напоминают агенту про активную цель.
+ *
+ * Использование:
+ *   goal                          показать текущую цель
+ *   goal <текст>                  создать новую
+ *   goal update <уточнение>       поправить формулировку
+ *   goal done                     закрыть (с проверкой)
+ *   goal blocked <причина>        отметить блокер
+ *   goal clear                    удалить без закрытия
+ *   goal --hook-context           вывод для UserPromptSubmit (JSON)
+ *   goal --hook-stop              проверка для Stop (exit 2 = блок)
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
+const STATE = join(
+  process.env.CLAUDE_DIR || join(homedir(), ".claude"),
+  "goal.json",
+);
+
+const read = () => {
+  try {
+    return JSON.parse(readFileSync(STATE, "utf8"));
+  } catch {
+    return null;
+  }
+};
+
+const write = (state) => {
+  mkdirSync(dirname(STATE), { recursive: true });
+  writeFileSync(STATE, JSON.stringify(state, null, 2) + "\n", "utf8");
+};
+
+const now = () => new Date().toISOString();
+
+const show = (g) => {
+  if (!g) {
+    console.log("Активной цели нет.");
+    console.log("Создать: goal <что получить и как проверить>");
+    return;
+  }
+  const age = Math.floor((Date.now() - Date.parse(g.created)) / 60000);
+  console.log(`Цель: ${g.text}`);
+  console.log(`Статус: ${g.status}${g.blocker ? ` (${g.blocker})` : ""}`);
+  console.log(`Создана: ${new Date(g.created).toLocaleString("ru-RU")}, ${age} мин назад`);
+  if (g.updated !== g.created)
+    console.log(`Обновлена: ${new Date(g.updated).toLocaleString("ru-RU")}`);
+  if (g.notes.length > 0) {
+    console.log("Заметки:");
+    for (const n of g.notes.slice(-5)) console.log(`  · ${n}`);
+  }
+};
+
+const args = process.argv.slice(2);
+const mode = args[0];
+
+// ── Хук UserPromptSubmit: подмешать активную цель в контекст ─────────
+if (mode === "--hook-context") {
+  const g = read();
+  if (g && g.status === "active") {
+    process.stdout.write(
+      `<active-goal>\n${g.text}\n\n` +
+        `Статус: ${g.status}. Продолжай эту задачу. ` +
+        `Не объявляй её готовой без проверки критерия. ` +
+        `Если пользователь ушёл в сторону — ответь и вернись к цели.\n` +
+        (g.blocker ? `Блокер: ${g.blocker}\n` : "") +
+        `</active-goal>\n`,
+    );
+  }
+  process.exit(0);
+}
+
+// ── Хук Stop: напомнить, что цель не закрыта ────────────────────────
+if (mode === "--hook-stop") {
+  const g = read();
+  if (g && g.status === "active") {
+    const age = Math.floor((Date.now() - Date.parse(g.created)) / 60000);
+    process.stderr.write(
+      `[goal] Цель не закрыта: ${g.text}\n` +
+        `[goal] В работе ${age} мин. Закрыть: goal done\n`,
+    );
+  }
+  process.exit(0);
+}
+
+// ── Обычные команды ─────────────────────────────────────────────────
+if (mode === "clear") {
+  write({ status: "none" });
+  console.log("Цель удалена.");
+  process.exit(0);
+}
+
+const g = read();
+
+if (!mode) {
+  show(g && g.status !== "none" ? g : null);
+  process.exit(0);
+}
+
+if (mode === "done") {
+  if (!g || g.status !== "active") {
+    console.error("Нет активной цели, закрывать нечего.");
+    process.exit(1);
+  }
+  g.status = "done";
+  g.updated = now();
+  g.notes.push(`закрыта ${new Date().toLocaleString("ru-RU")}`);
+  write(g);
+  console.log(`✓ Цель закрыта: ${g.text}`);
+  console.log("Убедись, что критерий проверен, а не «на глаз».");
+  process.exit(0);
+}
+
+if (mode === "update") {
+  const text = args.slice(1).join(" ").trim();
+  if (!g || g.status !== "active") {
+    console.error("Нет активной цели.");
+    process.exit(1);
+  }
+  if (!text) {
+    console.error("Укажите уточнение: goal update <текст>");
+    process.exit(1);
+  }
+  g.text = text;
+  g.updated = now();
+  g.notes.push(`обновлена: ${text}`);
+  write(g);
+  console.log(`Цель обновлена: ${text}`);
+  process.exit(0);
+}
+
+if (mode === "blocked") {
+  const reason = args.slice(1).join(" ").trim();
+  if (!g || g.status !== "active") {
+    console.error("Нет активной цели.");
+    process.exit(1);
+  }
+  if (!reason) {
+    console.error("Укажите причину: goal blocked <что мешает>");
+    process.exit(1);
+  }
+  g.status = "blocked";
+  g.blocker = reason;
+  g.updated = now();
+  g.notes.push(`блокер: ${reason}`);
+  write(g);
+  console.log(`Цель заблокирована: ${reason}`);
+  process.exit(0);
+}
+
+// Создание: весь ввод — формулировка
+const text = args.join(" ").trim();
+if (g && g.status === "active") {
+  console.error(`Уже есть активная цель: ${g.text}`);
+  console.error("Закрыть: goal done    Заменить: goal clear && goal <текст>");
+  process.exit(1);
+}
+write({
+  text,
+  status: "active",
+  created: now(),
+  updated: now(),
+  blocker: null,
+  notes: [],
+});
+console.log(`Цель зафиксирована: ${text}`);
+console.log("Проверить в любой момент: goal");
